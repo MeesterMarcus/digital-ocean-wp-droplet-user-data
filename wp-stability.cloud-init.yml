@@ -1,0 +1,151 @@
+#cloud-config
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /usr/local/sbin/wp-stability-init.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      LOG_FILE="/var/log/wp-stability-init.log"
+      exec > >(tee -a "$LOG_FILE") 2>&1
+
+      SWAPFILE="/swapfile"
+      SWAP_SIZE_GB="${SWAP_SIZE_GB:-2}"
+      SWAPPINESS="${SWAPPINESS:-10}"
+
+      MYSQL_LOW_MEM_CNF="/etc/mysql/conf.d/low-mem.cnf"
+      MYSQL_BUFFER_POOL="${MYSQL_BUFFER_POOL:-128M}"
+      MYSQL_MAX_CONNECTIONS="${MYSQL_MAX_CONNECTIONS:-50}"
+      MYSQL_TABLE_OPEN_CACHE="${MYSQL_TABLE_OPEN_CACHE:-200}"
+      MYSQL_TMP_TABLE_SIZE="${MYSQL_TMP_TABLE_SIZE:-32M}"
+      MYSQL_MAX_HEAP_TABLE_SIZE="${MYSQL_MAX_HEAP_TABLE_SIZE:-32M}"
+      MYSQL_INNODB_LOG_BUFFER_SIZE="${MYSQL_INNODB_LOG_BUFFER_SIZE:-16M}"
+
+      APACHE_PREFORK_CONF="/etc/apache2/mods-available/mpm_prefork.conf"
+
+      log() { printf '%s\n' "$*"; }
+
+      ensure_swap() {
+        local desired_bytes=$(( SWAP_SIZE_GB * 1024 * 1024 * 1024 ))
+        local current_bytes=0
+
+        if [[ -f "$SWAPFILE" ]]; then
+          current_bytes=$(stat -c '%s' "$SWAPFILE" 2>/dev/null || echo 0)
+        fi
+
+        local active="no"
+        if swapon --show --noheadings 2>/dev/null | awk '{print $1}' | grep -qx "$SWAPFILE"; then
+          active="yes"
+        fi
+
+        if [[ "$current_bytes" -ne "$desired_bytes" ]]; then
+          log "Configuring swapfile ${SWAPFILE} (${SWAP_SIZE_GB}G)"
+          if [[ "$active" == "yes" ]]; then
+            swapoff "$SWAPFILE" || true
+          fi
+          rm -f "$SWAPFILE"
+          fallocate -l "${SWAP_SIZE_GB}G" "$SWAPFILE"
+          chmod 600 "$SWAPFILE"
+          mkswap "$SWAPFILE" >/dev/null
+          swapon "$SWAPFILE"
+        else
+          if [[ "$active" != "yes" ]]; then
+            log "Enabling existing swapfile ${SWAPFILE}"
+            swapon "$SWAPFILE" || true
+          else
+            log "Swapfile already configured and active"
+          fi
+        fi
+
+        if ! grep -qE "^[[:space:]]*${SWAPFILE}[[:space:]]+none[[:space:]]+swap[[:space:]]" /etc/fstab; then
+          log "Persisting swapfile in /etc/fstab"
+          echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
+        fi
+      }
+
+      ensure_swappiness() {
+        log "Setting vm.swappiness=${SWAPPINESS}"
+        sysctl -w "vm.swappiness=${SWAPPINESS}" >/dev/null || true
+
+        local sysctl_file="/etc/sysctl.d/99-wp-stability.conf"
+        echo "vm.swappiness=${SWAPPINESS}" > "$sysctl_file"
+        sysctl --system >/dev/null || true
+      }
+
+      disable_packagekit() {
+        if systemctl list-unit-files 2>/dev/null | grep -q '^packagekit\.service'; then
+          log "Disabling packagekit"
+          systemctl disable --now packagekit >/dev/null 2>&1 || true
+        else
+          log "packagekit not present; skipping"
+        fi
+      }
+
+      tune_mysql() {
+        if systemctl list-unit-files 2>/dev/null | grep -q '^mysql\.service'; then
+          log "Writing MySQL low-mem config: ${MYSQL_LOW_MEM_CNF}"
+          mkdir -p "$(dirname "$MYSQL_LOW_MEM_CNF")"
+          cat > "$MYSQL_LOW_MEM_CNF" <<EOF
+      [mysqld]
+      innodb_buffer_pool_size = ${MYSQL_BUFFER_POOL}
+      innodb_log_buffer_size = ${MYSQL_INNODB_LOG_BUFFER_SIZE}
+      max_connections = ${MYSQL_MAX_CONNECTIONS}
+      table_open_cache = ${MYSQL_TABLE_OPEN_CACHE}
+      tmp_table_size = ${MYSQL_TMP_TABLE_SIZE}
+      max_heap_table_size = ${MYSQL_MAX_HEAP_TABLE_SIZE}
+      EOF
+          systemctl restart mysql || true
+          log "MySQL restarted"
+        else
+          log "mysql service not found; skipping MySQL tuning"
+        fi
+      }
+
+      tune_apache() {
+        if [[ -f "$APACHE_PREFORK_CONF" ]]; then
+          log "Tuning Apache prefork: ${APACHE_PREFORK_CONF}"
+          cat > "$APACHE_PREFORK_CONF" <<'EOF'
+      # prefork MPM (tuned for low-memory WordPress droplets)
+      <IfModule mpm_prefork_module>
+          StartServers             2
+          MinSpareServers          2
+          MaxSpareServers          5
+          MaxRequestWorkers       25
+          MaxConnectionsPerChild 300
+      </IfModule>
+      EOF
+        else
+          log "Apache prefork config not found; skipping Apache tuning"
+        fi
+
+        if systemctl list-unit-files 2>/dev/null | grep -q '^apache2\.service'; then
+          systemctl restart apache2 || true
+          log "Apache restarted"
+        else
+          log "apache2 service not found; skipping restart"
+        fi
+      }
+
+      main() {
+        log "=== WP stability init starting ==="
+        ensure_swap
+        ensure_swappiness
+        disable_packagekit
+        tune_mysql
+        tune_apache
+        log ""
+        log "Memory:"
+        free -h || true
+        log ""
+        log "Swap:"
+        swapon --show || true
+        log "=== WP stability init done ==="
+      }
+
+      main
+
+runcmd:
+  - [ bash, -lc, "/usr/local/sbin/wp-stability-init.sh" ]
